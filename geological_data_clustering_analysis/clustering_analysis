@@ -1,0 +1,322 @@
+
+
+import os
+import pandas as pd
+import numpy as np
+import re
+import warnings
+
+# Try to import GPU-accelerated clustering, fallback to CPU if not available
+try:
+    from cuml.cluster import KMeans  
+    use_gpu = True
+    print("Using GPU acceleration")
+except ImportError:
+    from sklearn.cluster import KMeans  
+    use_gpu = False
+    print("Using CPU for clustering")
+
+warnings.filterwarnings("ignore")
+
+# Configuration
+SINGLE_COLUMN_FOLDER = "test"  # Folder for single column analysis
+MULTI_COLUMN_FOLDER = "Combined Data files"  # Folder for multi-dimensional analysis
+MASTER_FILE = "cleaned_mastersheet.xlsx"  # Master sheet for age data
+
+# Keywords for multi-dimensional analysis
+keywords = {
+    "Sphericity": ["sphericity"],
+    "Perimeter": ["perimeter"],
+    "Elongation": ["elongation"]
+}
+
+def clean_column_name(name):
+    """Remove special characters from column names"""
+    return re.sub(r'[^a-zA-Z0-9 ]', '', name).lower()
+
+def find_optimal_k(data, max_clusters=100):
+    """Find optimal number of clusters using elbow method"""
+    distortions = []
+    
+    for k in range(1, max_clusters + 1):
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(data)
+        distortions.append(kmeans.inertia_)
+    
+    # Find the elbow point using the second derivative method
+    elbow_point = np.diff(distortions, 2).argmin() + 2  
+    return elbow_point
+
+def extract_attributes(file_name):
+    """Extract site, hole, core, etc. attributes from filename"""
+    pattern = r"(\d+)([A-Z]), (\d+)([A-Z])-(\d+), (\d+)-(\d+)"
+    match = re.search(pattern, file_name)
+    if match:
+        return {
+            "SITE": match.group(1),
+            "HOLE": match.group(2),
+            "CORE": match.group(3),
+            "CORE_TYPE": match.group(4),
+            "SECTION": match.group(5),
+            "TOP_DEPTH": match.group(6),
+            "BOTTOM_DEPTH": match.group(7),
+        }
+    return None
+
+def perform_single_column_analysis(folder_path):
+    """Perform clustering analysis on Sphericity column only"""
+    results = []
+    
+    if not os.path.exists(folder_path):
+        print(f"Folder '{folder_path}' not found. Skipping single column analysis.")
+        return pd.DataFrame()
+    
+    print(f"\n=== Single Column Analysis (Sphericity) ===")
+    print(f"Processing files in: {folder_path}")
+    
+    # Iterate through files in the folder
+    for file in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file)
+
+        if not file.endswith((".csv", ".xlsx", ".xls")):
+            print(f"Skipping {file} (Not a CSV/XLSX/XLS file)")
+            continue
+
+        try:
+            if file.endswith(".csv"):
+                df = pd.read_csv(file_path)
+            else:
+                df = pd.read_excel(file_path, engine="openpyxl")
+
+            # Remove last 3 rows (assuming they contain summary data)
+            df = df.iloc[:-3]
+
+            # Check if 'Sphericity' column exists
+            if "Sphericity" not in df.columns:
+                print(f"Skipping {file} (No 'Sphericity' column)")
+                continue
+
+            # Clean data and reshape for clustering
+            sphericity_data = df["Sphericity"].dropna().values.reshape(-1, 1)
+
+            # Ensure we have enough data points for clustering
+            if len(sphericity_data) < 2:
+                print(f"Skipping {file} (Not enough data points for clustering)")
+                continue
+
+            # Find optimal K
+            optimal_k = find_optimal_k(sphericity_data)
+            results.append([file, optimal_k, optimal_k])
+            print(f"Processed {file}: {optimal_k} clusters")
+
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+
+    # Create output dataframe
+    output_df = pd.DataFrame(results, columns=["File Name", "Number of Clusters", "Optimal K Used"])
+    
+    if not output_df.empty:
+        output_file = "single_column_analysis_results.xlsx"
+        output_df.to_excel(output_file, index=False, engine="openpyxl")
+        print(f"\nSingle column analysis completed! Results saved in '{output_file}'.")
+    
+    return output_df
+
+def perform_multi_dimensional_analysis(folder_path):
+    """Perform clustering analysis on multiple columns"""
+    results = []
+    
+    if not os.path.exists(folder_path):
+        print(f"Folder '{folder_path}' not found. Skipping multi-dimensional analysis.")
+        return pd.DataFrame()
+    
+    print(f"\n=== Multi-Dimensional Analysis ===")
+    print(f"Processing files in: {folder_path}")
+    
+    for file in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file)
+        
+        if not file.endswith((".csv", ".xlsx", ".xls")):
+            print(f"Skipping {file} (Not a CSV/XLSX/XLS file)")
+            continue
+        
+        try:
+            if file.endswith(".csv"):
+                df = pd.read_csv(file_path)
+            else:
+                df = pd.read_excel(file_path, engine="openpyxl")
+            
+            # Remove last 3 rows
+            df = df.iloc[:-3]
+            
+            # Create mapping of cleaned column names to original names
+            cleaned_columns = {clean_column_name(col): col for col in df.columns}
+            cluster_counts = {col: "N/A" for col in keywords.keys()}
+            
+            # Find and process each target column
+            for standard_name, keyword_list in keywords.items():
+                for cleaned_name, original_name in cleaned_columns.items():
+                    if any(keyword in cleaned_name for keyword in keyword_list):
+                        valid_data = df[original_name].dropna().values.reshape(-1, 1)
+                        if len(valid_data) >= 2:
+                            cluster_counts[standard_name] = find_optimal_k(valid_data)
+                        break 
+            
+            results.append([file, cluster_counts["Sphericity"], cluster_counts["Perimeter"], 
+                            cluster_counts["Elongation"]])
+            print(f"Processed {file}: Sph={cluster_counts['Sphericity']}, Per={cluster_counts['Perimeter']}, Elo={cluster_counts['Elongation']}")
+        
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+    
+    # Create output dataframe
+    output_df = pd.DataFrame(results, columns=["File Name", "NC Sphericity", "NC Perimeter", "NC Elongation"])
+    
+    if not output_df.empty:
+        output_file = "multi_dimensional_analysis_results.xlsx"
+        output_df.to_excel(output_file, index=False, engine="openpyxl")
+        print(f"\nMulti-dimensional analysis completed! Results saved in '{output_file}'")
+    
+    return output_df
+
+def integrate_age_data(clusters_df, master_file_path):
+    """Integrate age data from master sheet into clustering results"""
+    
+    if clusters_df.empty:
+        print("No clustering results to process for age integration.")
+        return clusters_df
+    
+    if not os.path.exists(master_file_path):
+        print(f"Master file '{master_file_path}' not found. Skipping age integration.")
+        return clusters_df
+    
+    print(f"\n=== Age Data Integration ===")
+    print(f"Loading master file: {master_file_path}")
+    
+    try:
+        # Load master sheet
+        master_df = pd.read_excel(master_file_path, engine="openpyxl", skiprows=1)
+        master_df.columns = master_df.columns.str.strip().str.upper()
+        
+        # Ensure required columns exist
+        required_columns = ["SITE", "HOLE", "CORE", "CORE_TYPE", "SECTION", "TOP_DEPTH", "BOTTOM_DEPTH", "AGE (MA)"]
+        missing_cols = [col for col in required_columns if col not in master_df.columns]
+        
+        if missing_cols:
+            print(f"Warning: Missing columns in master sheet: {missing_cols}")
+            return clusters_df
+        
+        # Prepare clustering dataframe
+        clusters_df = clusters_df.copy()
+        clusters_df.columns = clusters_df.columns.str.strip().str.upper()
+        
+        # Add Age column if it doesn't exist
+        if "AGE (MA)" not in clusters_df.columns:
+            clusters_df["AGE (MA)"] = np.nan
+        
+        matched_count = 0
+        
+        # Iterate over clustering results and match with master data
+        for index, row in clusters_df.iterrows():
+            file_name = row["FILE NAME"]
+            attributes = extract_attributes(file_name)
+            
+            if attributes:
+                # Convert attributes to appropriate types
+                for key in attributes:
+                    try:
+                        attributes[key] = float(attributes[key]) if "." in attributes[key] else int(attributes[key])
+                    except ValueError:
+                        pass  # Keep it as a string if conversion fails
+
+                # Find matching row in master sheet
+                match = master_df[
+                    (master_df["SITE"] == attributes["SITE"]) &
+                    (master_df["HOLE"] == attributes["HOLE"]) &
+                    (master_df["CORE"] == attributes["CORE"]) &
+                    (master_df["CORE_TYPE"] == attributes["CORE_TYPE"]) &
+                    (master_df["SECTION"] == attributes["SECTION"]) &
+                    (master_df["TOP_DEPTH"] == attributes["TOP_DEPTH"]) &
+                    (master_df["BOTTOM_DEPTH"] == attributes["BOTTOM_DEPTH"])
+                ]
+
+                if not match.empty:
+                    clusters_df.at[index, "AGE (MA)"] = match["AGE (MA)"].values[0]
+                    matched_count += 1
+                else:
+                    clusters_df.at[index, "AGE (MA)"] = "N/A"
+        
+        print(f"Successfully matched {matched_count} out of {len(clusters_df)} records with age data.")
+        
+        # Save the integrated results
+        output_file = "integrated_results_with_age.xlsx"
+        clusters_df.to_excel(output_file, index=False, engine="openpyxl")
+        print(f"Age integration completed! Results saved in '{output_file}'.")
+        
+        return clusters_df
+        
+    except Exception as e:
+        print(f"Error during age integration: {e}")
+        return clusters_df
+
+def main():
+    """Main function to run the complete analysis pipeline"""
+    
+    print("="*60)
+    print("    GEOLOGICAL DATA CLUSTERING ANALYSIS PIPELINE")
+    print("="*60)
+    
+    # Run single column analysis
+    single_results = perform_single_column_analysis(SINGLE_COLUMN_FOLDER)
+    
+    # Run multi-dimensional analysis
+    multi_results = perform_multi_dimensional_analysis(MULTI_COLUMN_FOLDER)
+    
+    # Integrate age data with results (prefer multi-dimensional if available)
+    if not multi_results.empty:
+        final_results = integrate_age_data(multi_results, MASTER_FILE)
+    elif not single_results.empty:
+        final_results = integrate_age_data(single_results, MASTER_FILE)
+    else:
+        print("No results available for age integration.")
+        final_results = pd.DataFrame()
+    
+    # Display summary
+    print("\n" + "="*60)
+    print("           ANALYSIS SUMMARY")
+    print("="*60)
+
+    if not single_results.empty:
+        print(f"\nSingle Column Analysis (Sphericity):")
+        print(f"   - Files processed: {len(single_results)}")
+        print(f"   - Results saved: single_column_analysis_results.xlsx")
+
+    if not multi_results.empty:
+        print(f"\nMulti-Dimensional Analysis:")
+        print(f"   - Files processed: {len(multi_results)}")
+        print(f"   - Columns analyzed: Sphericity, Perimeter, Elongation")
+        print(f"   - Results saved: multi_dimensional_analysis_results.xlsx")
+
+    if not final_results.empty:
+        print(f"\nAge Integration:")
+        age_matched = final_results["AGE (MA)"].notna().sum()
+        print(f"   - Records with age data: {age_matched}/{len(final_results)}")
+        print(f"   - Final results saved: integrated_results_with_age.xlsx")
+
+    print(f"\nComputation: {'GPU' if use_gpu else 'CPU'}")
+    print("\nPipeline completed successfully!")
+    print("="*60)
+
+    # Display sample results if available
+    if not final_results.empty:
+        print("\nSample Results (first 5 rows):")
+        print(final_results.head().to_string(index=False))
+    elif not multi_results.empty:
+        print("\nSample Multi-Dimensional Results (first 5 rows):")
+        print(multi_results.head().to_string(index=False))
+    elif not single_results.empty:
+        print("\nSample Single Column Results (first 5 rows):")
+        print(single_results.head().to_string(index=False))
+
+if __name__ == "__main__":
+    main()
